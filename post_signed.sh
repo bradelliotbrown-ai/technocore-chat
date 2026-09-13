@@ -141,6 +141,7 @@ import http.client
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -149,6 +150,82 @@ import urllib.request
 from pathlib import Path
 
 room, text, seed_file, base_url = sys.argv[1:5]
+state_dir = Path.home() / ".config" / "technocore" / "nonces"
+uid = os.getuid()
+
+
+def state_error(message):
+    raise SystemExit(
+        f"Error: unsafe Technocore nonce state: {message}. "
+        "Refusing to repair-and-trust persistent state; recover or remove it explicitly."
+    )
+
+
+def validate_state_dir():
+    while True:
+        try:
+            info = os.lstat(state_dir)
+        except FileNotFoundError:
+            try:
+                state_dir.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            # This directory was created by this process, so tightening it is not
+            # a repair of previously exposed state. Re-enter validation to verify it.
+            continue
+
+        if not stat.S_ISDIR(info.st_mode):
+            state_error(f"{state_dir} is a symlink or is not a directory")
+        if info.st_uid != uid:
+            state_error(f"{state_dir} is not owned by the current user")
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & 0o022:
+            state_error(f"{state_dir} permissions are {mode:o}; it was group/world-writable")
+
+        # A safe-but-broader existing mode (for example 0755) has not allowed
+        # another local user to replace entries, so it can be tightened now.
+        os.chmod(state_dir, 0o700)
+        return
+
+
+def validate_existing_state_file(path, label):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+
+    if not stat.S_ISREG(info.st_mode):
+        state_error(f"{label} is a symlink or is not a regular file: {path}")
+    if info.st_uid != uid:
+        state_error(f"{label} is not owned by the current user: {path}")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode != 0o600:
+        state_error(f"{label} permissions are {mode:o}; expected 600 at {path}")
+    return True
+
+
+def open_state_file():
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    while True:
+        existed = validate_existing_state_file(state_file, "nonce state file")
+        flags = os.O_RDWR | nofollow
+        if existed:
+            fd = os.open(state_file, flags)
+        else:
+            try:
+                fd = os.open(state_file, flags | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                continue
+            os.fchmod(fd, 0o600)
+
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o600:
+            os.close(fd)
+            state_error(f"nonce state file changed during validation: {state_file}")
+        return os.fdopen(fd, "r+", encoding="utf-8")
+
+
+validate_state_dir()
 
 try:
     raw_seed = Path(seed_file).read_text(encoding="ascii")
@@ -173,13 +250,15 @@ did = subprocess.run(
     env=env,
 ).stdout.strip()
 
-state_dir = Path.home() / ".config" / "technocore" / "nonces"
-state_dir.mkdir(parents=True, exist_ok=True)
-os.chmod(state_dir, 0o700)
-
 key = hashlib.sha256((did + "\0" + room).encode()).hexdigest()
 state_file = state_dir / key
 pending_file = state_dir / f"{key}.pending"
+
+# Existing entries may have been planted while this directory was unsafe in an
+# earlier run. Reject them before opening or mutating anything. The directory is
+# now 0700, so another local user cannot swap them after this validation.
+validate_existing_state_file(state_file, "nonce state file")
+validate_existing_state_file(pending_file, "pending outcome marker")
 
 
 def persist_nonce(f, nonce):
@@ -262,7 +341,7 @@ def reconcile(payload):
 
 
 def fsync_state_dir():
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     directory_fd = os.open(state_dir, flags)
     try:
         os.fsync(directory_fd)
@@ -274,6 +353,9 @@ def write_pending(payload):
     # Write-ahead marker: it must be durable before any request bytes are sent.
     # That closes the crash/power-loss window between a server commit and client
     # exception handling. A restart can reconcile this exact signed attempt.
+    if validate_existing_state_file(pending_file, "pending outcome marker"):
+        state_error(f"pending outcome marker already exists unexpectedly: {pending_file}")
+
     record = {
         "did": payload["did"],
         "room": room,
@@ -283,15 +365,16 @@ def write_pending(payload):
         "state": "in_flight",
     }
     temp_file = pending_file.with_name(f"{pending_file.name}.tmp-{os.getpid()}")
-    fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temp_file, flags, 0o600)
     try:
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as pending:
             json.dump(record, pending, sort_keys=True)
             pending.write("\n")
             pending.flush()
             os.fsync(pending.fileno())
         os.replace(temp_file, pending_file)
-        os.chmod(pending_file, 0o600)
         fsync_state_dir()
     except BaseException:
         try:
@@ -302,18 +385,37 @@ def write_pending(payload):
 
 
 def clear_pending():
-    try:
-        pending_file.unlink()
-    except FileNotFoundError:
+    if not validate_existing_state_file(pending_file, "pending outcome marker"):
         return
+    pending_file.unlink()
     fsync_state_dir()
 
 
 def read_pending():
+    if not validate_existing_state_file(pending_file, "pending outcome marker"):
+        raise SystemExit(f"Error: unresolved Technocore outcome marker disappeared: {pending_file}")
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(pending_file, flags)
     try:
-        raw = pending_file.read_text(encoding="utf-8")
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o600:
+            state_error(f"pending outcome marker changed during validation: {pending_file}")
+        with os.fdopen(fd, "r", encoding="utf-8") as pending:
+            fd = -1
+            raw = pending.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SystemExit(
+            f"Error: unresolved Technocore outcome marker is unreadable at {pending_file}: {exc}. "
+            "Refusing any new signed post until an operator resolves it explicitly."
+        )
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    try:
         record = json.loads(raw)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except json.JSONDecodeError as exc:
         raise SystemExit(
             f"Error: unresolved Technocore outcome marker is unreadable at {pending_file}: {exc}. "
             "Refusing any new signed post until an operator resolves it explicitly."
@@ -356,15 +458,14 @@ def handle_unknown(payload, error):
     return False
 
 
-with state_file.open("a+", encoding="utf-8") as f:
-    os.chmod(state_file, 0o600)
+with open_state_file() as f:
     fcntl.flock(f.fileno(), fcntl.LOCK_EX)
 
     # A prior process may have died after creating its write-ahead marker, perhaps
     # even after the server committed the post. Reconcile before allocating any
     # new nonce. If the exact record cannot be proven present, block all later
     # sends until an operator explicitly resolves the marker.
-    if pending_file.exists():
+    if validate_existing_state_file(pending_file, "pending outcome marker"):
         pending = read_pending()
         if reconcile(pending):
             clear_pending()
