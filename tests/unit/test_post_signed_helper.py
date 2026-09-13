@@ -9,7 +9,7 @@ from pathlib import Path
 from tests.unit.technocore_post_test_support import install_trusted_git
 
 
-TEST_SEED = "0123456789abcdef" * 4
+TEST_SEED = "0" * 64
 
 
 def _helper_env(tmp_path, port, repo):
@@ -83,10 +83,7 @@ def test_real_helper_serializes_concurrent_delivery(tmp_path) -> None:
         )
 
         time.sleep(0.2)
-
-        # B must still be blocked behind A's per-DID/per-room lock.
         assert b.poll() is None
-
         release_first.set()
 
         out_a, err_a = a.communicate(timeout=10)
@@ -98,7 +95,6 @@ def test_real_helper_serializes_concurrent_delivery(tmp_path) -> None:
 
         first_nonce = int(received[0]["nonce"])
         second_nonce = int(received[1]["nonce"])
-
         assert received[0]["text"] == "first"
         assert received[1]["text"] == "second"
         assert second_nonce > first_nonce
@@ -171,6 +167,117 @@ def test_real_helper_recovers_from_remote_nonce_high_water(tmp_path) -> None:
         nonce_files = list((home / ".config" / "technocore" / "nonces").iterdir())
         assert len(nonce_files) == 1
         assert int(nonce_files[0].read_text().strip()) == retry_nonce
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_real_helper_reconciles_committed_post_after_unreadable_response(tmp_path) -> None:
+    repo = Path(__file__).resolve().parents[2]
+    helper = repo / "post_signed.sh"
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            received.append(json.loads(self.rfile.read(length)))
+            self.send_response(200)
+            self.send_header("Content-Length", "1")
+            self.end_headers()
+            self.wfile.write(b"\xff")
+
+        def do_GET(self):
+            messages = [
+                {
+                    "from": item["did"],
+                    "sig": item["sig"],
+                    "nonce": int(item["nonce"]),
+                    "text": item["text"],
+                }
+                for item in received
+            ]
+            body = json.dumps({"messages": messages}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    home, env = _helper_env(tmp_path, server.server_port, repo)
+
+    try:
+        result = subprocess.run(
+            ["bash", str(helper), "test-room", "once only"],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "exact signed record is present" in result.stdout
+        assert len(received) == 1
+        assert not list((home / ".config" / "technocore" / "nonces").glob("*.pending"))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_real_helper_blocks_retry_while_outcome_is_unresolved(tmp_path) -> None:
+    repo = Path(__file__).resolve().parents[2]
+    helper = repo / "post_signed.sh"
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            received.append(json.loads(self.rfile.read(length)))
+            self.send_response(200)
+            self.send_header("Content-Length", "1")
+            self.end_headers()
+            self.wfile.write(b"\xff")
+
+        def do_GET(self):
+            body = json.dumps({"messages": []}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    home, env = _helper_env(tmp_path, server.server_port, repo)
+
+    try:
+        first = subprocess.run(
+            ["bash", str(helper), "test-room", "uncertain"],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert first.returncode == 2
+        assert len(received) == 1
+        assert len(list((home / ".config" / "technocore" / "nonces").glob("*.pending"))) == 1
+
+        second = subprocess.run(
+            ["bash", str(helper), "test-room", "uncertain"],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert second.returncode == 2
+        assert len(received) == 1
     finally:
         server.shutdown()
         server.server_close()
