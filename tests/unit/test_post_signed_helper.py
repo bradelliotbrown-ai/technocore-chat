@@ -281,3 +281,86 @@ def test_real_helper_blocks_retry_while_outcome_is_unresolved(tmp_path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_real_helper_persists_attempt_before_post_and_reconciles_after_process_death(tmp_path) -> None:
+    repo = Path(__file__).resolve().parents[2]
+    helper = repo / "post_signed.sh"
+    received = []
+    post_seen = threading.Event()
+    release_response = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            received.append(json.loads(self.rfile.read(length)))
+            post_seen.set()
+            release_response.wait(timeout=5)
+            try:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def do_GET(self):
+            messages = [
+                {
+                    "from": item["did"],
+                    "sig": item["sig"],
+                    "nonce": int(item["nonce"]),
+                    "text": item["text"],
+                }
+                for item in received
+            ]
+            body = json.dumps({"messages": messages}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    home, env = _helper_env(tmp_path, server.server_port, repo)
+
+    first = None
+    try:
+        first = subprocess.Popen(
+            ["bash", str(helper), "test-room", "crash-safe"],
+            cwd=repo,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert post_seen.wait(timeout=5)
+
+        pending = list((home / ".config" / "technocore" / "nonces").glob("*.pending"))
+        assert len(pending) == 1, "attempt marker must be durable before the server sees the POST"
+
+        first.kill()
+        first.communicate(timeout=5)
+        release_response.set()
+
+        second = subprocess.run(
+            ["bash", str(helper), "test-room", "crash-safe"],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert second.returncode == 0, second.stderr
+        assert "Previous outcome-unknown post is present" in second.stdout
+        assert len(received) == 1, "restart must reconcile instead of posting under a fresh nonce"
+        assert not list((home / ".config" / "technocore" / "nonces").glob("*.pending"))
+    finally:
+        release_response.set()
+        if first is not None and first.poll() is None:
+            first.kill()
+            first.communicate(timeout=5)
+        server.shutdown()
+        server.server_close()
