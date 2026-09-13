@@ -207,8 +207,7 @@ def signed_payload(nonce):
     return payload, json.dumps(payload).encode()
 
 
-def post(nonce):
-    payload, encoded = signed_payload(nonce)
+def post(payload, encoded):
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/r/{room}",
         data=encoded,
@@ -217,17 +216,17 @@ def post(nonce):
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            return response.read().decode(), None, payload, None
+            return response.read().decode(), None, None
     except urllib.error.HTTPError as exc:
         try:
             body = exc.read().decode()
         except (OSError, UnicodeDecodeError, http.client.HTTPException):
             body = f"HTTP {exc.code} response body could not be read"
-        return body, exc.code, payload, None
+        return body, exc.code, None
     except (OSError, UnicodeDecodeError, http.client.HTTPException) as exc:
         # The request may already have committed before the connection failed or
         # the response became unreadable. Never classify this as a definite miss.
-        return None, None, payload, exc
+        return None, None, exc
 
 
 def reconcile(payload):
@@ -262,22 +261,52 @@ def reconcile(payload):
     )
 
 
-def write_pending(payload, error):
+def fsync_state_dir():
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(state_dir, flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def write_pending(payload):
+    # Write-ahead marker: it must be durable before any request bytes are sent.
+    # That closes the crash/power-loss window between a server commit and client
+    # exception handling. A restart can reconcile this exact signed attempt.
     record = {
         "did": payload["did"],
         "room": room,
         "nonce": payload["nonce"],
         "sig": payload["sig"],
         "text": payload["text"],
-        "error": f"{type(error).__name__}: {error}",
+        "state": "in_flight",
     }
-    fd = os.open(pending_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as pending:
-        json.dump(record, pending, sort_keys=True)
-        pending.write("\n")
-        pending.flush()
-        os.fsync(pending.fileno())
-    os.chmod(pending_file, 0o600)
+    temp_file = pending_file.with_name(f"{pending_file.name}.tmp-{os.getpid()}")
+    fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as pending:
+            json.dump(record, pending, sort_keys=True)
+            pending.write("\n")
+            pending.flush()
+            os.fsync(pending.fileno())
+        os.replace(temp_file, pending_file)
+        os.chmod(pending_file, 0o600)
+        fsync_state_dir()
+    except BaseException:
+        try:
+            temp_file.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def clear_pending():
+    try:
+        pending_file.unlink()
+    except FileNotFoundError:
+        return
+    fsync_state_dir()
 
 
 def read_pending():
@@ -313,16 +342,16 @@ def report_unknown(payload, error):
 
 
 def handle_unknown(payload, error):
-    # A bounded tail read is enough to prove success when the exact signed record
-    # is present. Absence is not proof of failure (the room may be busy or the read
-    # may itself fail), so preserve a blocking marker instead of risking a duplicate.
+    # The write-ahead marker already exists. A bounded tail read is enough to
+    # prove success when the exact signed record is present. Absence is not proof
+    # of failure, so keep the marker and fail closed instead of risking duplicate.
     if reconcile(payload):
+        clear_pending()
         print(
             "Technocore response was lost, but the exact signed record is present in the room; "
             "treating the post as delivered."
         )
         return True
-    write_pending(payload, error)
     report_unknown(payload, error)
     return False
 
@@ -331,14 +360,14 @@ with state_file.open("a+", encoding="utf-8") as f:
     os.chmod(state_file, 0o600)
     fcntl.flock(f.fileno(), fcntl.LOCK_EX)
 
-    # A prior transport/read failure may have happened after the server committed
-    # the write. Reconcile it before allocating any new nonce. If it cannot be
-    # proven present, block all later sends until an operator explicitly resolves
-    # the marker; advancing to a fresh nonce could duplicate the logical message.
+    # A prior process may have died after creating its write-ahead marker, perhaps
+    # even after the server committed the post. Reconcile before allocating any
+    # new nonce. If the exact record cannot be proven present, block all later
+    # sends until an operator explicitly resolves the marker.
     if pending_file.exists():
         pending = read_pending()
         if reconcile(pending):
-            pending_file.unlink()
+            clear_pending()
             if pending["text"] == text:
                 print(
                     "Previous outcome-unknown post is present in the room; "
@@ -365,11 +394,17 @@ with state_file.open("a+", encoding="utf-8") as f:
     nonce = max(last + 1, clock)
     persist_nonce(f, nonce)
 
-    body, status, payload, unknown = post(nonce)
+    payload, encoded = signed_payload(nonce)
+    write_pending(payload)
+    body, status, unknown = post(payload, encoded)
     if unknown is not None:
         if handle_unknown(payload, unknown):
             raise SystemExit(0)
         raise SystemExit(2)
+
+    # Any normal HTTP response is a definite transport outcome. Only now is it
+    # safe to remove the write-ahead marker.
+    clear_pending()
     if status is None:
         print(body)
         raise SystemExit(0)
@@ -384,11 +419,14 @@ with state_file.open("a+", encoding="utf-8") as f:
         server_last = int(match.group(1))
         retry_nonce = max(server_last + 1, nonce + 1, time.time_ns() // 1_000_000)
         persist_nonce(f, retry_nonce)
-        body, status, payload, unknown = post(retry_nonce)
+        payload, encoded = signed_payload(retry_nonce)
+        write_pending(payload)
+        body, status, unknown = post(payload, encoded)
         if unknown is not None:
             if handle_unknown(payload, unknown):
                 raise SystemExit(0)
             raise SystemExit(2)
+        clear_pending()
         if status is None:
             print(body)
             raise SystemExit(0)
