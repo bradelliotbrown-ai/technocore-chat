@@ -3,7 +3,9 @@ set -euo pipefail
 
 ROOM="${1:-}"
 TEXT="${2:-}"
-SEED_FILE="$HOME/.config/technocore/sign_seed"
+CONFIG_DIR="$HOME/.config"
+SEED_DIR="$CONFIG_DIR/technocore"
+SEED_FILE="$SEED_DIR/sign_seed"
 BASE_URL="${TECHNOCORE_BASE_URL:-https://technocore.chat}"
 REPO_URL="https://github.com/flop-labs/technocore-chat.git"
 
@@ -86,18 +88,51 @@ verify_signing_checkout() {
   done
 }
 
+verify_seed_path() {
+  local uid path perms owner
+  uid="$(id -u)"
+
+  # These directories control the persistent identity pathname. Do not repair
+  # an unsafe existing path and continue: prior group/world write access means
+  # the seed may already have been replaced. Revalidate immediately before use.
+  for path in "$CONFIG_DIR" "$SEED_DIR"; do
+    if [[ -L "$path" || ! -d "$path" ]]; then
+      echo "Error: persistent seed parent is not a regular directory: $path" >&2
+      echo "Refusing seed use; recover or rotate the Technocore identity explicitly." >&2
+      exit 1
+    fi
+    owner="$(stat -c '%u' -- "$path")"
+    if [[ "$owner" != "$uid" ]]; then
+      echo "Error: persistent seed parent is not owned by the current user: $path" >&2
+      echo "Refusing seed use; recover or rotate the Technocore identity explicitly." >&2
+      exit 1
+    fi
+    perms="$(stat -c '%a' -- "$path")"
+    if (( (8#$perms & 0022) != 0 )); then
+      echo "Error: persistent seed parent permissions are $perms at $path; it is group/world-writable." >&2
+      echo "Refusing seed use; do not chmod-and-continue with this DID. Recover or rotate explicitly." >&2
+      exit 1
+    fi
+  done
+
+  if [[ -L "$SEED_FILE" || ! -f "$SEED_FILE" ]]; then
+    echo "Error: Technocore seed path is missing, a symlink, or not a regular file: $SEED_FILE" >&2
+    exit 1
+  fi
+  owner="$(stat -c '%u' -- "$SEED_FILE")"
+  if [[ "$owner" != "$uid" ]]; then
+    echo "Error: Technocore seed file is not owned by the current user; refusing seed use." >&2
+    exit 1
+  fi
+  perms="$(stat -c '%a' -- "$SEED_FILE")"
+  if [[ "$perms" != "600" ]]; then
+    echo "Error: seed file permissions are $perms; expected 600" >&2
+    exit 1
+  fi
+}
+
 verify_signing_checkout
-
-if [[ ! -f "$SEED_FILE" ]]; then
-  echo "Error: Technocore seed file not found at $SEED_FILE"
-  exit 1
-fi
-
-PERMS="$(stat -c '%a' "$SEED_FILE")"
-if [[ "$PERMS" != "600" ]]; then
-  echo "Error: seed file permissions are $PERMS; expected 600"
-  exit 1
-fi
+verify_seed_path
 
 python3 - "$ROOM" "$TEXT" "$SEED_FILE" "$BASE_URL" <<'INNERPY'
 import fcntl
