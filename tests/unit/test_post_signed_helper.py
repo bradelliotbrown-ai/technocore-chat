@@ -6,11 +6,13 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from tests.unit.technocore_post_test_support import install_trusted_git
+
 
 TEST_SEED = "0123456789abcdef" * 4
 
 
-def _helper_env(tmp_path, port):
+def _helper_env(tmp_path, port, repo):
     home = tmp_path / "home"
     seed_dir = home / ".config" / "technocore"
     seed_dir.mkdir(parents=True)
@@ -18,8 +20,13 @@ def _helper_env(tmp_path, port):
     seed_file.write_text(TEST_SEED + "\n")
     seed_file.chmod(0o600)
 
+    bin_dir = tmp_path / "git-bin"
+    bin_dir.mkdir()
+    install_trusted_git(bin_dir, repo)
+
     env = os.environ.copy()
     env["HOME"] = str(home)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
     env["TECHNOCORE_BASE_URL"] = f"http://127.0.0.1:{port}"
     return home, env
 
@@ -52,7 +59,7 @@ def test_real_helper_serializes_concurrent_delivery(tmp_path) -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    _, env = _helper_env(tmp_path, server.server_port)
+    _, env = _helper_env(tmp_path, server.server_port, repo)
 
     try:
         a = subprocess.Popen(
@@ -141,7 +148,7 @@ def test_real_helper_recovers_from_remote_nonce_high_water(tmp_path) -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    home, env = _helper_env(tmp_path, server.server_port)
+    home, env = _helper_env(tmp_path, server.server_port, repo)
 
     try:
         result = subprocess.run(
