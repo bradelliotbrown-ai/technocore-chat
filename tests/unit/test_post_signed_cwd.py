@@ -11,6 +11,9 @@ from pathlib import Path
 import pytest
 
 
+TEST_SEED = "0123456789abcdef" * 4
+
+
 @pytest.mark.parametrize("invocation", ["absolute", "relative"])
 @pytest.mark.parametrize("caller_has_signer", [False, True], ids=["empty-cwd", "decoy-signer"])
 def test_posting_uses_own_checkout_from_unrelated_cwd(
@@ -25,10 +28,10 @@ def test_posting_uses_own_checkout_from_unrelated_cwd(
     # Exercise the real shell/Python helper, but keep the signing protocol local:
     # the uv stand-in actually executes the relative script it was passed.
     (checkout / "scripts" / "sign.py").write_text(
-        """import os
+        f"""import os
 import sys
 
-assert os.environ["SIGN_SEED"] == "test-seed"
+assert os.environ["SIGN_SEED"] == {TEST_SEED!r}
 if sys.argv[1:] == ["did"]:
     print("did:key:helper-fixture")
 elif sys.argv[1] == "say" and len(sys.argv) == 5:
@@ -55,7 +58,7 @@ raise SystemExit("caller-controlled signer must not execute")
     home = tmp_path / "home"
     seed_file = home / ".config" / "technocore" / "sign_seed"
     seed_file.parent.mkdir(parents=True)
-    seed_file.write_text("test-seed\n")
+    seed_file.write_text(TEST_SEED + "\n")
     seed_file.chmod(0o600)
 
     bin_dir = tmp_path / "bin"
@@ -123,7 +126,7 @@ os.execv(sys.executable, [sys.executable, *args[1:]])
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
-    assert "test-seed" not in result.stdout + result.stderr
+    assert TEST_SEED not in result.stdout + result.stderr
     assert not caller_marker.exists()
     calls = [json.loads(line) for line in uv_log.read_text().splitlines()]
     assert len(calls) == 2
@@ -149,5 +152,5 @@ os.execv(sys.executable, [sys.executable, *args[1:]])
     nonce_files = list((seed_file.parent / "nonces").iterdir())
     assert len(nonce_files) == 1
     assert int(nonce_files[0].read_text()) == int(payload["nonce"]) > 0
-    assert seed_file.read_text() == "test-seed\n"
+    assert seed_file.read_text() == TEST_SEED + "\n"
     assert stat.S_IMODE(seed_file.stat().st_mode) == 0o600
