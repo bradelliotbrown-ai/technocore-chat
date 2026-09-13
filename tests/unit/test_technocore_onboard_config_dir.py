@@ -5,7 +5,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 OFFICIAL_REPO_URL = "https://github.com/flop-labs/technocore-chat.git"
 
 
@@ -43,7 +42,9 @@ def test_existing_group_world_writable_config_dir_fails_before_seed_or_signer(tm
     home = tmp_path / "home"
     fake_repo = home / "technocore-chat"
     fake_repo.parent.mkdir(parents=True)
-    subprocess.run([real_git, "clone", "-q", str(upstream), str(fake_repo)], check=True, env=git_env)
+    subprocess.run(
+        [real_git, "clone", "-q", str(upstream), str(fake_repo)], check=True, env=git_env
+    )
     subprocess.run(
         [real_git, "-C", str(fake_repo), "remote", "set-url", "origin", OFFICIAL_REPO_URL],
         check=True,

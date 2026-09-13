@@ -6,7 +6,6 @@ import pytest
 
 from tests.unit.technocore_post_test_support import install_trusted_git
 
-
 TEST_SEED = "0123456789abcdef" * 4
 
 

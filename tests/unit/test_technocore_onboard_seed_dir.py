@@ -5,7 +5,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 OFFICIAL_REPO_URL = "https://github.com/flop-labs/technocore-chat.git"
 
 
@@ -43,7 +42,9 @@ def test_existing_group_world_writable_seed_dir_fails_before_signer(tmp_path) ->
     home = tmp_path / "home"
     fake_repo = home / "technocore-chat"
     fake_repo.parent.mkdir(parents=True)
-    subprocess.run([real_git, "clone", "-q", str(upstream), str(fake_repo)], check=True, env=git_env)
+    subprocess.run(
+        [real_git, "clone", "-q", str(upstream), str(fake_repo)], check=True, env=git_env
+    )
     subprocess.run(
         [real_git, "-C", str(fake_repo), "remote", "set-url", "origin", OFFICIAL_REPO_URL],
         check=True,
@@ -85,7 +86,7 @@ from pathlib import Path
 args = sys.argv[1:]
 if args == ["sync", "--frozen"]:
     raise SystemExit(0)
-if args == ["run", "--frozen", "scripts/sign.py", "did"]:
+if args == ["run", "--frozen", "python", "scripts/sign.py", "did"]:
     Path(os.environ["TEST_DID_MARKER"]).write_text("called")
     print("did:key:should-not-be-reported")
     raise SystemExit(0)

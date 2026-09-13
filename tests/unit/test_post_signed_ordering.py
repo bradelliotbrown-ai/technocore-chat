@@ -1,9 +1,6 @@
-import fcntl
-import os
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 
 def test_concurrent_delivery_preserves_nonce_order(tmp_path) -> None:
@@ -11,7 +8,7 @@ def test_concurrent_delivery_preserves_nonce_order(tmp_path) -> None:
 
     worker = tmp_path / "worker.py"
     worker.write_text(
-        r'''
+        r"""
 import fcntl
 import os
 import sys
@@ -44,21 +41,17 @@ with state_file.open("a+") as f:
         log.write(f"{label}:{nonce}\n")
         log.flush()
         os.fsync(log.fileno())
-'''
+"""
     )
 
     state_file = tmp_path / "nonce"
     log_file = tmp_path / "delivery.log"
 
-    a = subprocess.Popen(
-        [sys.executable, str(worker), str(state_file), "A", "0.4", str(log_file)]
-    )
+    a = subprocess.Popen([sys.executable, str(worker), str(state_file), "A", "0.4", str(log_file)])
 
     time.sleep(0.1)
 
-    b = subprocess.Popen(
-        [sys.executable, str(worker), str(state_file), "B", "0", str(log_file)]
-    )
+    b = subprocess.Popen([sys.executable, str(worker), str(state_file), "B", "0", str(log_file)])
 
     assert a.wait(timeout=5) == 0
     assert b.wait(timeout=5) == 0

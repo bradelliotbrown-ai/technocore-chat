@@ -3,7 +3,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 OFFICIAL_REPO_URL = "https://github.com/flop-labs/technocore-chat.git"
 
 
@@ -57,6 +56,4 @@ def init_trusted_checkout(path: Path) -> None:
         check=True,
     )
     subprocess.run([real_git, "-C", str(path), "add", "."], check=True)
-    subprocess.run(
-        [real_git, "-C", str(path), "commit", "-qm", "trusted fixture"], check=True
-    )
+    subprocess.run([real_git, "-C", str(path), "commit", "-qm", "trusted fixture"], check=True)

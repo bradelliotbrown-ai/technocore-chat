@@ -7,7 +7,6 @@ from pathlib import Path
 
 from tests.unit.technocore_post_test_support import install_trusted_git
 
-
 TEST_SEED = "0" * 64
 
 
@@ -57,7 +56,7 @@ def test_real_helper_keeps_pending_on_unproven_http_500(tmp_path) -> None:
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, *args):
+        def log_message(self, format, *args):  # noqa: A002 - the base class's spelling
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

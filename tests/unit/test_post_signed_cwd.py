@@ -12,7 +12,6 @@ import pytest
 
 from tests.unit.technocore_post_test_support import init_trusted_checkout, install_trusted_git
 
-
 TEST_SEED = "0123456789abcdef" * 4
 
 
@@ -80,9 +79,9 @@ from pathlib import Path
 args = sys.argv[1:]
 with Path(os.environ["TEST_UV_LOG"]).open("a") as log:
     log.write(json.dumps({"cwd": str(Path.cwd()), "args": args}) + "\\n")
-if args[:3] != ["run", "--frozen", "scripts/sign.py"]:
+if args[:4] != ["run", "--frozen", "python", "scripts/sign.py"]:
     raise SystemExit("unexpected uv arguments")
-os.execv(sys.executable, [sys.executable, *args[2:]])
+os.execv(sys.executable, [sys.executable, *args[3:]])
 """
     )
     fake_uv.chmod(0o755)
@@ -98,7 +97,7 @@ os.execv(sys.executable, [sys.executable, *args[2:]])
             self.end_headers()
             self.wfile.write(b"ok")
 
-        def log_message(self, *args):
+        def log_message(self, format, *args):  # noqa: A002 - the base class's own spelling
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -136,19 +135,20 @@ os.execv(sys.executable, [sys.executable, *args[2:]])
     calls = [json.loads(line) for line in uv_log.read_text().splitlines()]
     assert len(calls) == 2
     assert all(call["cwd"] == str(checkout.resolve()) for call in calls)
-    assert calls[0]["args"] == ["run", "--frozen", "scripts/sign.py", "did"]
+    assert calls[0]["args"] == ["run", "--frozen", "python", "scripts/sign.py", "did"]
     assert len(received) == 1
     request_path, payload = received[0]
     assert request_path == "/r/test-room"
     assert payload == {
         "did": "did:key:helper-fixture",
         "sig": "fixture-signature",
-        "nonce": calls[1]["args"][5],
+        "nonce": calls[1]["args"][6],
         "text": message,
     }
     assert calls[1]["args"] == [
         "run",
         "--frozen",
+        "python",
         "scripts/sign.py",
         "say",
         "test-room",

@@ -166,7 +166,7 @@ env = os.environ.copy()
 env["SIGN_SEED"] = seed
 
 did = subprocess.run(
-    ["uv", "run", "--frozen", "scripts/sign.py", "did"],
+    ["uv", "run", "--frozen", "python", "scripts/sign.py", "did"],
     check=True,
     capture_output=True,
     text=True,
@@ -192,7 +192,7 @@ def persist_nonce(f, nonce):
 
 def signed_payload(nonce):
     signed = subprocess.run(
-        ["uv", "run", "--frozen", "scripts/sign.py", "say", room, str(nonce), text],
+        ["uv", "run", "--frozen", "python", "scripts/sign.py", "say", room, str(nonce), text],
         check=True,
         capture_output=True,
         text=True,
@@ -356,35 +356,6 @@ def handle_unknown(payload, error):
     return False
 
 
-def handle_server_error(payload, body, status):
-    if status is None or not 500 <= status <= 599:
-        return
-
-    # A 5xx is not proof that the signed write failed: the server may append the
-    # record before a later response-building step errors. Keep the write-ahead
-    # marker unless an exact room read proves that this signed record is present.
-    if reconcile(payload):
-        clear_pending()
-        print(
-            f"Technocore returned HTTP {status}, but the exact signed record is present in the room; "
-            "treating the post as delivered."
-        )
-        raise SystemExit(0)
-
-    print("Error: signed Technocore POST has an unknown outcome after a server error.", file=sys.stderr)
-    print(f"DID: {payload['did']}", file=sys.stderr)
-    print(f"Room: {room}", file=sys.stderr)
-    print(f"Nonce: {payload['nonce']}", file=sys.stderr)
-    print(f"Text: {payload['text']}", file=sys.stderr)
-    print(f"HTTP {status}: {body}", file=sys.stderr)
-    print(
-        f"No later signed post for this DID/room will be sent while {pending_file} exists. "
-        "Inspect the room and remove that marker only after an explicit operator decision.",
-        file=sys.stderr,
-    )
-    raise SystemExit(2)
-
-
 with state_file.open("a+", encoding="utf-8") as f:
     os.chmod(state_file, 0o600)
     fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -431,10 +402,16 @@ with state_file.open("a+", encoding="utf-8") as f:
             raise SystemExit(0)
         raise SystemExit(2)
 
-    handle_server_error(payload, body, status)
+    # A 5xx only proves that the response path failed. The append may already be
+    # durable, so treat it exactly like a lost/unreadable response: reconcile the
+    # signed record and retain the pending marker unless delivery can be proved.
+    if status is not None and 500 <= status <= 599:
+        if handle_unknown(payload, RuntimeError(f"HTTP {status}: {body}")):
+            raise SystemExit(0)
+        raise SystemExit(2)
 
-    # Successful responses and definite 4xx refusals are safe to clear. A 5xx
-    # is handled above as outcome-unknown because the server may have appended.
+    # A successful response or a 4xx is a definite outcome. Only now is it safe
+    # to remove the write-ahead marker.
     clear_pending()
     if status is None:
         print(body)
@@ -457,7 +434,10 @@ with state_file.open("a+", encoding="utf-8") as f:
             if handle_unknown(payload, unknown):
                 raise SystemExit(0)
             raise SystemExit(2)
-        handle_server_error(payload, body, status)
+        if status is not None and 500 <= status <= 599:
+            if handle_unknown(payload, RuntimeError(f"HTTP {status}: {body}")):
+                raise SystemExit(0)
+            raise SystemExit(2)
         clear_pending()
         if status is None:
             print(body)

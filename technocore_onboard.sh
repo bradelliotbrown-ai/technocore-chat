@@ -289,7 +289,7 @@ verify_checkout
 
 echo
 echo "Public DID:"
-SIGN_SEED="$(cat "$SEED_FILE")" uv run --frozen scripts/sign.py did
+SIGN_SEED="$(cat "$SEED_FILE")" uv run --frozen python scripts/sign.py did
 
 echo
 echo "Setup complete."
