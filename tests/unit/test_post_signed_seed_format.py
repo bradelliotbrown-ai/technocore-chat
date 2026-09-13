@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.unit.technocore_post_test_support import install_trusted_git
+
 
 @pytest.mark.parametrize(
     "seed_text",
@@ -31,6 +33,7 @@ def test_post_helper_rejects_invalid_persisted_seed_before_signing(
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    install_trusted_git(bin_dir, repo)
     uv_marker = tmp_path / "uv-invoked"
     fake_uv = bin_dir / "uv"
     fake_uv.write_text(
