@@ -137,6 +137,7 @@ verify_seed_path
 python3 - "$ROOM" "$TEXT" "$SEED_FILE" "$BASE_URL" <<'INNERPY'
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -178,6 +179,7 @@ os.chmod(state_dir, 0o700)
 
 key = hashlib.sha256((did + "\0" + room).encode()).hexdigest()
 state_file = state_dir / key
+pending_file = state_dir / f"{key}.pending"
 
 
 def persist_nonce(f, nonce):
@@ -196,33 +198,165 @@ def signed_payload(nonce):
         text=True,
         env=env,
     ).stdout.splitlines()
-    return json.dumps(
-        {
-            "did": signed[0],
-            "sig": signed[-1],
-            "nonce": str(nonce),
-            "text": text,
-        }
-    ).encode()
+    payload = {
+        "did": signed[0],
+        "sig": signed[-1],
+        "nonce": str(nonce),
+        "text": text,
+    }
+    return payload, json.dumps(payload).encode()
 
 
 def post(nonce):
+    payload, encoded = signed_payload(nonce)
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/r/{room}",
-        data=signed_payload(nonce),
+        data=encoded,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            return response.read().decode(), None
+            return response.read().decode(), None, payload, None
     except urllib.error.HTTPError as exc:
-        return exc.read().decode(), exc.code
+        try:
+            body = exc.read().decode()
+        except (OSError, UnicodeDecodeError, http.client.HTTPException):
+            body = f"HTTP {exc.code} response body could not be read"
+        return body, exc.code, payload, None
+    except (OSError, UnicodeDecodeError, http.client.HTTPException) as exc:
+        # The request may already have committed before the connection failed or
+        # the response became unreadable. Never classify this as a definite miss.
+        return None, None, payload, exc
+
+
+def reconcile(payload):
+    """Return True only when the exact attempted signed record is in a bounded tail read."""
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/r/{room}?format=json&limit=200",
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            view = json.loads(response.read().decode())
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        http.client.HTTPException,
+        urllib.error.HTTPError,
+    ):
+        return False
+
+    messages = view.get("messages") if isinstance(view, dict) else None
+    if not isinstance(messages, list):
+        return False
+
+    return any(
+        isinstance(record, dict)
+        and record.get("from") == payload.get("did")
+        and str(record.get("nonce")) == str(payload.get("nonce"))
+        and record.get("sig") == payload.get("sig")
+        and record.get("text") == payload.get("text")
+        for record in messages
+    )
+
+
+def write_pending(payload, error):
+    record = {
+        "did": payload["did"],
+        "room": room,
+        "nonce": payload["nonce"],
+        "sig": payload["sig"],
+        "text": payload["text"],
+        "error": f"{type(error).__name__}: {error}",
+    }
+    fd = os.open(pending_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as pending:
+        json.dump(record, pending, sort_keys=True)
+        pending.write("\n")
+        pending.flush()
+        os.fsync(pending.fileno())
+    os.chmod(pending_file, 0o600)
+
+
+def read_pending():
+    try:
+        raw = pending_file.read_text(encoding="utf-8")
+        record = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(
+            f"Error: unresolved Technocore outcome marker is unreadable at {pending_file}: {exc}. "
+            "Refusing any new signed post until an operator resolves it explicitly."
+        )
+    required = {"did", "room", "nonce", "sig", "text"}
+    if not isinstance(record, dict) or not required.issubset(record):
+        raise SystemExit(
+            f"Error: unresolved Technocore outcome marker is malformed at {pending_file}. "
+            "Refusing any new signed post until an operator resolves it explicitly."
+        )
+    return record
+
+
+def report_unknown(payload, error):
+    print("Error: signed Technocore POST has an unknown outcome.", file=sys.stderr)
+    print(f"DID: {payload['did']}", file=sys.stderr)
+    print(f"Room: {room}", file=sys.stderr)
+    print(f"Nonce: {payload['nonce']}", file=sys.stderr)
+    print(f"Text: {payload['text']}", file=sys.stderr)
+    print(f"Transport/read error: {type(error).__name__}: {error}", file=sys.stderr)
+    print(
+        f"No later signed post for this DID/room will be sent while {pending_file} exists. "
+        "Inspect the room and remove that marker only after an explicit operator decision.",
+        file=sys.stderr,
+    )
+
+
+def handle_unknown(payload, error):
+    # A bounded tail read is enough to prove success when the exact signed record
+    # is present. Absence is not proof of failure (the room may be busy or the read
+    # may itself fail), so preserve a blocking marker instead of risking a duplicate.
+    if reconcile(payload):
+        print(
+            "Technocore response was lost, but the exact signed record is present in the room; "
+            "treating the post as delivered."
+        )
+        return True
+    write_pending(payload, error)
+    report_unknown(payload, error)
+    return False
 
 
 with state_file.open("a+", encoding="utf-8") as f:
     os.chmod(state_file, 0o600)
     fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+
+    # A prior transport/read failure may have happened after the server committed
+    # the write. Reconcile it before allocating any new nonce. If it cannot be
+    # proven present, block all later sends until an operator explicitly resolves
+    # the marker; advancing to a fresh nonce could duplicate the logical message.
+    if pending_file.exists():
+        pending = read_pending()
+        if reconcile(pending):
+            pending_file.unlink()
+            if pending["text"] == text:
+                print(
+                    "Previous outcome-unknown post is present in the room; "
+                    "not sending the same logical message again."
+                )
+                raise SystemExit(0)
+        else:
+            print("Error: a previous signed Technocore POST still has an unknown outcome.", file=sys.stderr)
+            print(f"DID: {pending['did']}", file=sys.stderr)
+            print(f"Room: {pending['room']}", file=sys.stderr)
+            print(f"Nonce: {pending['nonce']}", file=sys.stderr)
+            print(f"Text: {pending['text']}", file=sys.stderr)
+            print(
+                f"Refusing a new signed post. Inspect the room and remove {pending_file} only "
+                "after an explicit operator decision.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
 
     f.seek(0)
     raw = f.read().strip()
@@ -231,7 +365,11 @@ with state_file.open("a+", encoding="utf-8") as f:
     nonce = max(last + 1, clock)
     persist_nonce(f, nonce)
 
-    body, status = post(nonce)
+    body, status, payload, unknown = post(nonce)
+    if unknown is not None:
+        if handle_unknown(payload, unknown):
+            raise SystemExit(0)
+        raise SystemExit(2)
     if status is None:
         print(body)
         raise SystemExit(0)
@@ -246,7 +384,11 @@ with state_file.open("a+", encoding="utf-8") as f:
         server_last = int(match.group(1))
         retry_nonce = max(server_last + 1, nonce + 1, time.time_ns() // 1_000_000)
         persist_nonce(f, retry_nonce)
-        body, status = post(retry_nonce)
+        body, status, payload, unknown = post(retry_nonce)
+        if unknown is not None:
+            if handle_unknown(payload, unknown):
+                raise SystemExit(0)
+            raise SystemExit(2)
         if status is None:
             print(body)
             raise SystemExit(0)
