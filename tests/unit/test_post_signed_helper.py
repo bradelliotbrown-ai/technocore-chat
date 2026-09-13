@@ -7,12 +7,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+TEST_SEED = "0123456789abcdef" * 4
+
+
 def _helper_env(tmp_path, port):
     home = tmp_path / "home"
     seed_dir = home / ".config" / "technocore"
     seed_dir.mkdir(parents=True)
     seed_file = seed_dir / "sign_seed"
-    seed_file.write_text("test-seed\n")
+    seed_file.write_text(TEST_SEED + "\n")
     seed_file.chmod(0o600)
 
     env = os.environ.copy()
