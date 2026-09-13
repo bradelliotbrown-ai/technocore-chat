@@ -42,7 +42,17 @@ from pathlib import Path
 
 room, text, seed_file, base_url = sys.argv[1:5]
 
-seed = Path(seed_file).read_text().strip()
+try:
+    raw_seed = Path(seed_file).read_text(encoding="ascii")
+except (OSError, UnicodeDecodeError):
+    raise SystemExit("Error: persisted Technocore seed is unreadable; refusing to sign.")
+
+if re.fullmatch(r"[0-9a-f]{64}\n", raw_seed) is None:
+    raise SystemExit(
+        "Error: persisted Technocore seed is not the generated 64-lowercase-hex format; "
+        "refusing to sign."
+    )
+seed = raw_seed[:-1]
 
 env = os.environ.copy()
 env["SIGN_SEED"] = seed
