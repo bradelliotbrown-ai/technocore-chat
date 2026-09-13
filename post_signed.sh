@@ -5,6 +5,7 @@ ROOM="${1:-}"
 TEXT="${2:-}"
 SEED_FILE="$HOME/.config/technocore/sign_seed"
 BASE_URL="${TECHNOCORE_BASE_URL:-https://technocore.chat}"
+REPO_URL="https://github.com/flop-labs/technocore-chat.git"
 
 if [[ -z "$ROOM" || -z "$TEXT" ]]; then
   echo "Usage: $0 <room> \"message text\""
@@ -15,6 +16,77 @@ fi
 # working directory, which may contain an unrelated project or scripts/sign.py.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 cd -- "$SCRIPT_DIR"
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "Error: git is not installed; refusing persistent seed use." >&2
+  exit 1
+fi
+
+# The helper may outlive onboarding: the checkout can be changed after a safe
+# setup. Re-authenticate the exact signer/dependency inputs immediately before
+# the persistent seed is read, without updating refs, the index, or user work.
+checked_git() {
+  git --no-replace-objects -c core.fsmonitor=false -C "$SCRIPT_DIR" "$@"
+}
+
+verify_signing_checkout() {
+  local origin canonical upstream_record upstream_sha path expected actual
+
+  if ! checked_git rev-parse --git-dir >/dev/null 2>&1; then
+    echo "Error: posting helper is not inside a Git checkout; refusing persistent seed use." >&2
+    exit 1
+  fi
+
+  origin="$(checked_git remote get-url origin 2>/dev/null || true)"
+  canonical="${origin%/}"
+  canonical="${canonical%.git}"
+  case "$canonical" in
+    "https://github.com/flop-labs/technocore-chat"|"git@github.com:flop-labs/technocore-chat"|"ssh://git@github.com/flop-labs/technocore-chat")
+      ;;
+    *)
+      echo "Error: posting checkout origin is not the official flop-labs/technocore-chat repository." >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ "$(checked_git ls-remote --get-url "$REPO_URL")" != "$REPO_URL" ]]; then
+    echo "Error: refusing a rewritten official repository URL before seed use." >&2
+    exit 1
+  fi
+
+  if ! upstream_record="$(checked_git ls-remote --exit-code "$REPO_URL" refs/heads/main)"; then
+    echo "Error: cannot verify official main; refusing persistent seed use." >&2
+    exit 1
+  fi
+  upstream_sha="${upstream_record%%$'\t'*}"
+  if [[ ! "$upstream_sha" =~ ^[0-9a-f]{40}$ ||
+        "$upstream_record" != "$upstream_sha"$'\t'"refs/heads/main" ]]; then
+    echo "Error: unexpected official main response; refusing persistent seed use." >&2
+    exit 1
+  fi
+
+  # Trust only the execution inputs that will receive or influence SIGN_SEED.
+  # The checkout may contain unrelated local work, but these raw files must be
+  # byte-for-byte the content advertised by official main. --no-filters and
+  # --no-replace-objects prevent Git metadata from hiding a modified signer.
+  for path in scripts/sign.py pyproject.toml uv.lock; do
+    if ! expected="$(checked_git rev-parse --verify "$upstream_sha:$path" 2>/dev/null)"; then
+      echo "Error: verified upstream signing content is unavailable locally; update the official checkout before posting." >&2
+      exit 1
+    fi
+    if [[ ! -f "$SCRIPT_DIR/$path" || -L "$SCRIPT_DIR/$path" ]]; then
+      echo "Error: $path is not a regular verified upstream file; refusing persistent seed use." >&2
+      exit 1
+    fi
+    actual="$(checked_git hash-object --no-filters -- "$SCRIPT_DIR/$path")"
+    if [[ "$actual" != "$expected" ]]; then
+      echo "Error: $path differs from verified upstream content; refusing persistent seed use." >&2
+      exit 1
+    fi
+  done
+}
+
+verify_signing_checkout
 
 if [[ ! -f "$SEED_FILE" ]]; then
   echo "Error: Technocore seed file not found at $SEED_FILE"
@@ -58,7 +130,7 @@ env = os.environ.copy()
 env["SIGN_SEED"] = seed
 
 did = subprocess.run(
-    ["uv", "run", "scripts/sign.py", "did"],
+    ["uv", "run", "--frozen", "scripts/sign.py", "did"],
     check=True,
     capture_output=True,
     text=True,
@@ -83,7 +155,7 @@ def persist_nonce(f, nonce):
 
 def signed_payload(nonce):
     signed = subprocess.run(
-        ["uv", "run", "scripts/sign.py", "say", room, str(nonce), text],
+        ["uv", "run", "--frozen", "scripts/sign.py", "say", room, str(nonce), text],
         check=True,
         capture_output=True,
         text=True,
