@@ -48,7 +48,15 @@ def init_trusted_checkout(path: Path) -> None:
     real_git = shutil.which("git")
     assert real_git is not None
     subprocess.run([real_git, "init", "-q", "-b", "main", str(path)], check=True)
-    subprocess.run([real_git, "-C", str(path), "config", "user.email", "test@example.invalid"], check=True)
-    subprocess.run([real_git, "-C", str(path), "config", "user.name", "Technocore tests"], check=True)
+    subprocess.run(
+        [real_git, "-C", str(path), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        [real_git, "-C", str(path), "config", "user.name", "Technocore tests"],
+        check=True,
+    )
     subprocess.run([real_git, "-C", str(path), "add", "."], check=True)
-    subprocess.run([real_git, "-C", str(path), "commit", "-qm", "trusted fixture"], check=True)
+    subprocess.run(
+        [real_git, "-C", str(path), "commit", "-qm", "trusted fixture"], check=True
+    )
