@@ -225,8 +225,6 @@ def open_state_file():
         return os.fdopen(fd, "r+", encoding="utf-8")
 
 
-validate_state_dir()
-
 try:
     raw_seed = Path(seed_file).read_text(encoding="ascii")
 except (OSError, UnicodeDecodeError):
@@ -238,6 +236,9 @@ if re.fullmatch(r"[0-9a-f]{64}\n", raw_seed) is None:
         "refusing to sign."
     )
 seed = raw_seed[:-1]
+
+# Reject malformed identity material before creating or changing nonce state.
+validate_state_dir()
 
 env = os.environ.copy()
 env["SIGN_SEED"] = seed

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
 
@@ -80,7 +81,9 @@ class HelperRun:
         assert request.full_url.startswith("http://127.0.0.1:9/r/test-room")
         assert timeout in (5, 20)
         if request.get_method() == "GET":
-            return io.BytesIO(json.dumps({"messages": self.messages if self.reveal else []}).encode())
+            return io.BytesIO(
+                json.dumps({"messages": self.messages if self.reveal else []}).encode()
+            )
         assert request.get_method() == "POST"
         payload = json.loads(request.data)
         self.attempts.append(payload)
@@ -104,7 +107,9 @@ class HelperRun:
             if self.mode == "disconnect":
                 raise urllib.error.URLError("fixture: committed write, response lost")
             if self.mode == "5xx":
-                raise urllib.error.HTTPError(request.full_url, 503, "fixture", {}, io.BytesIO(b"lost"))
+                raise urllib.error.HTTPError(
+                    request.full_url, 503, "fixture", Message(), io.BytesIO(b"lost")
+                )
             return io.BytesIO(b"\xff")
         return io.BytesIO(b"ok")
 
