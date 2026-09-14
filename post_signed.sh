@@ -14,7 +14,7 @@ if [[ -z "$ROOM" || -z "$TEXT" ]]; then
   exit 1
 fi
 
-# Resolve both uv signer calls from this helper's checkout, never the caller's
+# Resolve all uv signer calls from this helper's checkout, never the caller's
 # working directory, which may contain an unrelated project or scripts/sign.py.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 cd -- "$SCRIPT_DIR"
@@ -269,9 +269,38 @@ def persist_nonce(f, nonce):
     os.fsync(f.fileno())
 
 
+def canonical_text(value):
+    """Use the verified signer's sweep, with its interpreter and Unicode tables."""
+    if not isinstance(value, str):
+        raise SystemExit("Error: pending message text must be a string; refusing to send.")
+    # Printable ASCII with trimmed ends is unchanged by the documented sweep.
+    # Avoid an extra interpreter startup for ordinary single-line messages.
+    if value.isascii() and value.isprintable() and value == value.strip():
+        return value
+    sweep_env = os.environ.copy()
+    sweep_env.pop("SIGN_SEED", None)  # Canonicalization does not need a signing key.
+    result = subprocess.run(
+        [
+            "uv", "run", "--frozen", "python", "-c",
+            'import json, runpy, sys; signer = runpy.run_path("scripts/sign.py"); '
+            'value = json.loads(sys.stdin.read()); '
+            'print(json.dumps(signer["swept"](value, signer["MAX_TEXT_CHARS"])))',
+        ],
+        input=json.dumps(value),
+        check=True,
+        capture_output=True,
+        text=True,
+        env=sweep_env,
+    )
+    return json.loads(result.stdout)
+
+
 def signed_payload(nonce):
     signed = subprocess.run(
-        ["uv", "run", "--frozen", "python", "scripts/sign.py", "say", room, str(nonce), text],
+        [
+            "uv", "run", "--frozen", "python", "scripts/sign.py", "say", room, str(nonce),
+            *(["--"] if text.startswith("-") else []), text,
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -426,6 +455,9 @@ def read_pending():
             f"Error: unresolved Technocore outcome marker is malformed at {pending_file}. "
             "Refusing any new signed post until an operator resolves it explicitly."
         )
+    # Older helper versions persisted raw CLI text. Sweep it in memory only;
+    # retain the original marker until exact DID/nonce/signature/text proof exists.
+    record["text"] = canonical_text(record["text"])
     return record
 
 
@@ -457,6 +489,9 @@ def handle_unknown(payload, error):
     report_unknown(payload, error)
     return False
 
+
+# One canonical value drives signing, POST, pending storage, and restart equality.
+text = canonical_text(text)
 
 with open_state_file() as f:
     fcntl.flock(f.fileno(), fcntl.LOCK_EX)
